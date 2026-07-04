@@ -6,3 +6,4 @@ originals/
 bin/openmemory
 bin/openmemory.exe
 bun.lock
+*.db
