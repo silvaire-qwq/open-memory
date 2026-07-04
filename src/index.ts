@@ -2,10 +2,10 @@ import * as path from "node:path";
 import * as os from "node:os";
 import { mkdirSync } from "node:fs";
 
-import { spawnSync } from "node:child_process";
 import { serve } from "./server.js";
 import { openDb } from "./memory.js";
 import * as Tools from "./tools.js";
+import { startTui } from "./tui.js";
 import type { Database } from "bun:sqlite";
 
 function main(): void {
@@ -26,21 +26,8 @@ function main(): void {
   const db = openDb(dbPath);
 
   if (args[0] === "tui") {
-    // Ink needs stdin.setRawMode — compiled binary can't do it.
-    // Spawn bun to run the source file directly.
-    const tryPath = (p: string) => {
-      try { return Bun.file(p).size > 0; } catch { return false; }
-    };
-    const cwdSrc = path.resolve(process.cwd(), "src", "tui.ts");
-    const binSrc = path.resolve(path.dirname(process.argv[1] || ""), "..", "src", "tui.ts");
-    const tuiPath = tryPath(cwdSrc) ? cwdSrc : tryPath(binSrc) ? binSrc : "";
-    if (!tuiPath) { process.stderr.write("Cannot find src/tui.ts — run from project directory\n"); process.exit(1); }
-    const cp = spawnSync("bun", ["run", tuiPath], {
-      stdio: "inherit",
-      env: { ...process.env, OPENMEMORY_DB_PATH: dbPath },
-      cwd: process.cwd(),
-    });
-    process.exit(cp.status ?? 0);
+    startTui(db);
+    return;
   }
 
   if (args.length > 0) {

@@ -240,12 +240,15 @@ function App({ db }: { db: Database }) {
   );
 }
 
-// Standalone entry point — run with: bun run src/tui.ts
-const dbPath = process.env.OPENMEMORY_DB_PATH;
-if (!dbPath) {
-  process.stderr.write("OPENMEMORY_DB_PATH not set\n");
-  process.exit(1);
+export function startTui(db: import("bun:sqlite").Database): void {
+  const { waitUntilExit } = render(React.createElement(App, { db }));
+  waitUntilExit();
 }
-const db = Memory.openDb(dbPath);
-const { waitUntilExit } = render(React.createElement(App, { db }));
-waitUntilExit();
+
+// Standalone entry point
+if (import.meta.main) {
+  const dbPath = process.env.OPENMEMORY_DB_PATH;
+  if (!dbPath) { process.stderr.write("OPENMEMORY_DB_PATH not set\n"); process.exit(1); }
+  const db = Memory.openDb(dbPath);
+  startTui(db);
+}
