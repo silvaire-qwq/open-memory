@@ -19,13 +19,13 @@ export function startWebServer(db: Database, port: number = 3030): void {
 
         if (query) {
           const results = Memory.search(db, query, { limit, min_similarity: 0 });
-          return json({ kind: "search", query, count: results.length, results });
+          return json({ kind: "search", query, count: results.length, results: stripEmbeddings(results) });
         }
 
         const opts: Memory.ListOptions = { limit, offset };
         if (category) opts.category = category;
         const results = Memory.list(db, opts);
-        return json({ kind: "list", count: results.length, results });
+        return json({ kind: "list", count: results.length, results: stripEmbeddings(results) });
       }
 
       if (url.pathname === "/api/memory" && method === "POST") {
@@ -55,7 +55,7 @@ export function startWebServer(db: Database, port: number = 3030): void {
         if (method === "GET") {
           const engram = Memory.get(db, id);
           if (!engram) return json({ error: "not found" }, 404);
-          return json({ engram });
+          return json({ engram: stripEmbedding(engram) });
         }
 
         if (method === "DELETE") {
@@ -79,6 +79,17 @@ export function startWebServer(db: Database, port: number = 3030): void {
   process.stderr.write(`\n  OpenMemory Web UI: http://localhost:${port}\n\n`);
 }
 
+type EngramLight = Omit<Memory.Engram, "embedding">;
+
+function stripEmbedding(e: Memory.Engram): EngramLight {
+  const { embedding: _, ...rest } = e;
+  return rest;
+}
+
+function stripEmbeddings(list: Memory.Engram[]): EngramLight[] {
+  return list.map(stripEmbedding);
+}
+
 function findExistingId(db: Database, content: string): number | null {
   const row = db.prepare("SELECT id FROM engrams WHERE content = ? LIMIT 1").get(content) as { id: number } | null;
   return row?.id ?? null;
@@ -98,17 +109,43 @@ function renderHtml(): string {
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>OpenMemory</title>
-<script src="https://cdn.tailwindcss.com"></script>
-<link href="https://fonts.googleapis.com/css2?family=Inter:opsz@14..32&display=swap" rel="stylesheet">
 <style>
-  * { font-family: 'Inter', system-ui, sans-serif; }
-  body { background: #0a0a0b; color: #e4e4e7; }
+  *, *::before, *::after { box-sizing: border-box; margin: 0; }
+  body { font-family: system-ui, -apple-system, sans-serif; background: #0a0a0b; color: #e4e4e7; padding: 24px; max-width: 1024px; margin: 0 auto; }
+  @media (min-width: 768px) { body { padding: 48px; } }
+  .flex { display: flex; } .items-center { align-items: center; } .items-start { align-items: flex-start; }
+  .justify-between { justify-content: space-between; } .justify-end { justify-content: flex-end; }
+  .gap-2 { gap: 8px; } .gap-3 { gap: 12px; } .gap-4 { gap: 16px; }
+  .shrink-0 { flex-shrink: 0; } .flex-1 { flex: 1; } .min-w-0 { min-width: 0; }
+  .flex-wrap { flex-wrap: wrap; }
+  .grid { display: grid; } .grid-cols-2 { grid-template-columns: 1fr 1fr; }
+  .mt-1 { margin-top: 4px; } .mt-2 { margin-top: 8px; } .mb-3 { margin-bottom: 12px; }
+  .mb-4 { margin-bottom: 16px; } .mb-6 { margin-bottom: 24px; }
+  .p-3 { padding: 12px; } .p-4 { padding: 16px; } .p-6 { padding: 24px; }
+  .px-2 { padding-left: 8px; padding-right: 8px; }
+  .py-12 { padding-top: 48px; padding-bottom: 48px; }
+  .text-xs { font-size: 12px; } .text-sm { font-size: 14px; } .text-lg { font-size: 18px; }
+  .text-2xl { font-size: 24px; }
+  .font-medium { font-weight: 500; } .font-semibold { font-weight: 600; }
+  .tracking-tight { letter-spacing: -0.025em; }
+  .leading-tight { line-height: 1.25; }
+  .text-center { text-align: center; }
+  .whitespace-pre-wrap { white-space: pre-wrap; } .break-words { word-break: break-word; }
+  .line-clamp-3 { display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+  .overflow-y-auto { overflow-y: auto; } .overflow-x-auto { overflow-x: auto; }
+  .max-h-40 { max-height: 160px; } .max-h-80vh { max-height: 80vh; }
+  .cursor-pointer { cursor: pointer; }
+  .hidden { display: none; }
+  .w-full { width: 100%; }
+  .rounded-lg { border-radius: 8px; }
+  .space-y-3 > * + * { margin-top: 12px; }
   .card { background: #18181b; border: 1px solid #27272a; border-radius: 12px; }
   .card-hover:hover { border-color: #3b3b3e; }
-  .badge { font-size: 11px; padding: 2px 8px; border-radius: 999px; background: #27272a; color: #a1a1aa; }
-  .input { background: #18181b; border: 1px solid #27272a; border-radius: 8px; padding: 8px 12px; color: #e4e4e7; outline: none; }
+  .badge { font-size: 11px; padding: 2px 8px; border-radius: 999px; background: #27272a; color: #a1a1aa; display: inline-block; }
+  .badge-hover:hover { background: #3b3b3e; }
+  .input { background: #18181b; border: 1px solid #27272a; border-radius: 8px; padding: 8px 12px; color: #e4e4e7; outline: none; width: 100%; }
   .input:focus { border-color: #6366f1; }
-  .btn { padding: 8px 16px; border-radius: 8px; font-size: 14px; cursor: pointer; border: none; transition: all .15s; }
+  .btn { padding: 8px 16px; border-radius: 8px; font-size: 14px; cursor: pointer; border: none; transition: all .15s; display: inline-flex; align-items: center; }
   .btn-primary { background: #6366f1; color: #fff; }
   .btn-primary:hover { background: #4f46e5; }
   .btn-ghost { background: transparent; color: #a1a1aa; border: 1px solid #27272a; }
@@ -122,13 +159,15 @@ function renderHtml(): string {
   ::-webkit-scrollbar { width: 6px; }
   ::-webkit-scrollbar-track { background: transparent; }
   ::-webkit-scrollbar-thumb { background: #3b3b3e; border-radius: 3px; }
+  label { display: block; margin-bottom: 4px; color: #71717a; }
+  .zinc-600 { color: #52525b; }
 </style>
 </head>
-<body class="p-4 md:p-8 max-w-5xl mx-auto">
+<body>
   <div class="flex items-center justify-between mb-6">
     <div>
-      <h1 class="text-2xl font-semibold tracking-tight">OpenMemory</h1>
-      <p class="text-sm text-zinc-500 mt-1" id="statsLine">Loading...</p>
+      <div class="text-2xl font-semibold tracking-tight">OpenMemory</div>
+      <div class="text-xs mt-1" style="color:#71717a" id="statsLine">Loading...</div>
     </div>
     <button onclick="showStoreModal()" class="btn btn-primary">+ New Memory</button>
   </div>
@@ -139,19 +178,19 @@ function renderHtml(): string {
     <button onclick="loadMemories()" class="btn btn-ghost">Clear</button>
   </div>
 
-  <div id="filters" class="flex gap-2 flex-wrap mb-4 text-sm"></div>
+  <div id="filters" class="flex gap-2 flex-wrap mb-4"></div>
 
   <div id="list" class="space-y-3"></div>
 
   <div id="storeModal" class="modal-overlay hidden fade-in" onclick="if(event.target===this)hideStoreModal()">
-    <div class="card p-6 w-full max-w-lg mx-4" onclick="event.stopPropagation()">
-      <h2 class="text-lg font-medium mb-4">New Memory</h2>
-      <textarea id="newContent" class="input w-full min-h-[100px] mb-3" placeholder="Content..."></textarea>
+    <div class="card p-6" style="width:100%;max-width:512px;margin:0 16px" onclick="event.stopPropagation()">
+      <div class="text-lg font-medium mb-4">New Memory</div>
+      <textarea id="newContent" class="input" style="min-height:100px;margin-bottom:12px;resize:vertical" placeholder="Content..."></textarea>
       <div class="grid grid-cols-2 gap-3 mb-3">
-        <div><label class="text-xs text-zinc-500 block mb-1">Category</label><input id="newCategory" class="input w-full" value="fact"></div>
-        <div><label class="text-xs text-zinc-500 block mb-1">Importance (0-1)</label><input id="newImportance" class="input w-full" value="0.5" type="number" step="0.1" min="0" max="1"></div>
+        <div><label>Category</label><input id="newCategory" class="input" value="fact"></div>
+        <div><label>Importance (0-1)</label><input id="newImportance" class="input" value="0.5" type="number" step="0.1" min="0" max="1"></div>
       </div>
-      <div class="mb-3"><label class="text-xs text-zinc-500 block mb-1">Tags (comma separated)</label><input id="newTags" class="input w-full" placeholder="tag1, tag2"></div>
+      <div class="mb-3"><label>Tags (comma separated)</label><input id="newTags" class="input" placeholder="tag1, tag2"></div>
       <div class="flex gap-2 justify-end">
         <button onclick="hideStoreModal()" class="btn btn-ghost">Cancel</button>
         <button onclick="storeMemory()" class="btn btn-primary">Save</button>
@@ -160,7 +199,7 @@ function renderHtml(): string {
   </div>
 
   <div id="detailModal" class="modal-overlay hidden fade-in" onclick="if(event.target===this)hideDetailModal()">
-    <div class="card p-6 w-full max-w-2xl mx-4 max-h-[80vh] overflow-y-auto" onclick="event.stopPropagation()">
+    <div class="card p-6" style="width:100%;max-width:640px;margin:0 16px;max-height:80vh;overflow-y:auto" onclick="event.stopPropagation()">
       <div id="detailContent"></div>
     </div>
   </div>
