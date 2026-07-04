@@ -442,6 +442,19 @@ export function supersede(
   return { ok: true };
 }
 
+/** Find active memories at or above a given importance threshold. */
+export function importanceAbove(db: Database, threshold: number, limit: number = 20): Engram[] {
+  const rows = db
+    .prepare(
+      `SELECT * FROM engrams
+       WHERE archived = 0 AND importance >= ?
+       ORDER BY importance DESC, created_at DESC
+       LIMIT ?`,
+    )
+    .all(threshold, limit) as Row[];
+  return rows.map(rowToEngram);
+}
+
 /** Find memories at or below an importance threshold. */
 export function decayed(db: Database, threshold: number, limit: number): Engram[] {
   const rows = db

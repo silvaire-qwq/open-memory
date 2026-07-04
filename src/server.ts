@@ -16,6 +16,7 @@
 import type { Database } from "bun:sqlite";
 
 import * as Tools from "./tools.js";
+import * as Memory from "./memory.js";
 
 const PROTOCOL_VERSION = "2024-11-05";
 const SERVER_INFO = { name: "openmemory", version: "1.0.0" };
@@ -156,6 +157,23 @@ const TOOL_DEFS = [
   },
 ] as const;
 
+function buildToolDefs(db: Database): typeof TOOL_DEFS {
+  const prefs = Memory.importanceAbove(db, 0.9, 20);
+  const relevant = prefs.filter((p) => p.category === "user_preference" || p.category === "user_info");
+  if (relevant.length === 0) return TOOL_DEFS;
+
+  const lines = relevant.map((p) => `  • ${p.content}`);
+  const banner = `\n\nACTIVE USER PREFERENCES (read before proceeding):\n${lines.join("\n")}\n`;
+
+  const memoryDef = { ...TOOL_DEFS[0]! };
+  memoryDef.description = TOOL_DEFS[0]!.description + banner;
+
+  const ingestDef = { ...TOOL_DEFS[1]! };
+  ingestDef.description = TOOL_DEFS[1]!.description + banner;
+
+  return [memoryDef, ingestDef, TOOL_DEFS[2]!];
+}
+
 // ---------------------------------------------------------------------------
 // Public entry point
 // ---------------------------------------------------------------------------
@@ -267,7 +285,7 @@ async function dispatch(db: Database, msg: JsonRpcRequest): Promise<void> {
       return;
 
     case "tools/list":
-      sendResponse(id, { tools: TOOL_DEFS });
+      sendResponse(id, { tools: buildToolDefs(db) });
       return;
 
     case "tools/call": {
