@@ -1,0 +1,8 @@
+node_modules/
+openmemory.db
+openmemory.db-shm
+openmemory.db-wal
+originals/
+bin/openmemory
+bin/openmemory.exe
+bun.lock
