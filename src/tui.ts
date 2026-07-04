@@ -1,363 +1,251 @@
-import type { Database } from "bun:sqlite";
 import * as Memory from "./memory.js";
+import React from "react";
+import { render, Text, Box, useInput, useStdout } from "ink";
+import type { Engram } from "./types.js";
 
-const ESC = "\x1b";
-const CSI = ESC + "[";
-const CLEAR = CSI + "2J" + CSI + "H";
-const HIDE = CSI + "?25l";
-const SHOW = CSI + "?25h";
-const RST = CSI + "0m";
-const BOLD = CSI + "1m";
-const DIM = CSI + "2m";
-const REV = CSI + "7m";
-const RED = CSI + "31m";
-const GRN = CSI + "32m";
-const YLW = CSI + "33m";
-const BLU = CSI + "34m";
-const MAG = CSI + "35m";
-const CYN = CSI + "36m";
-const WHT = CSI + "37m";
+type Light = Omit<Engram, "embedding">;
 
-type EngramLight = Omit<Memory.Engram, "embedding">;
-type Screen = "list" | "detail" | "confirm";
-type InputMode = "none" | "search" | "createContent" | "createCategory" | "createImportance" | "createTags" | "confirm";
-
-interface State {
-  screen: Screen;
-  memories: EngramLight[];
-  cursor: number;
-  offset: number;
-  searchQuery: string;
-  detailItem: EngramLight | null;
-  confirmMsg: string;
-  confirmAction: (() => void) | null;
-  statusMsg: string;
-  statusTime: number;
-  newContent: string;
-  newCategory: string;
-  newImportance: string;
-  newTags: string;
-}
-
-function firstLine(s: string): string {
-  return s.split("\n")[0]!.trim();
+function strip(e: Engram): Light {
+  const { embedding: _, ...r } = e;
+  return r;
 }
 
 function preview(s: string, max: number): string {
-  const line = firstLine(s);
-  // Strip YAML frontmatter markers
-  const clean = line.replace(/^---$/, "").replace(/^title:\s*/i, "");
-  if (clean.length <= max) return clean;
-  return clean.substring(0, max - 1) + "…";
+  const l = s.split("\n")[0]!.trim().replace(/^---$/, "").replace(/^title:\s*/i, "");
+  return l.length <= max ? l : l.substring(0, max - 1) + "…";
 }
 
 function catColor(cat: string): string {
-  if (cat.includes("user")) return CYN;
-  if (cat.includes("pref")) return MAG;
-  if (cat.includes("chat")) return YLW;
-  if (cat.includes("post") || cat.includes("blog")) return GRN;
-  if (cat.includes("tool")) return BLU;
-  return WHT;
+  if (cat.includes("user") || cat.includes("pref")) return "#22d3ee";
+  if (cat.includes("chat")) return "#facc15";
+  if (cat.includes("post") || cat.includes("blog")) return "#4ade80";
+  if (cat.includes("tool")) return "#60a5fa";
+  return "#e4e4e7";
 }
 
-export function startTui(db: Database): void {
-  const state: State = {
-    screen: "list",
-    memories: [],
-    cursor: 0, offset: 0,
-    searchQuery: "",
-    detailItem: null,
-    confirmMsg: "", confirmAction: null,
-    statusMsg: "", statusTime: 0,
-    newContent: "", newCategory: "fact", newImportance: "0.5", newTags: "",
-  };
+type View = "list" | "detail" | "create" | "confirm";
 
-  const stdin = process.stdin;
-  const stdout = process.stdout;
+function App({ db }: { db: Database }) {
+  const [memories, setMemories] = React.useState<Light[]>([]);
+  const [cursor, setCursor] = React.useState(0);
+  const [view, setView] = React.useState<View>("list");
+  const [search, setSearch] = React.useState("");
+  const [searching, setSearching] = React.useState(false);
+  const [searchBuf, setSearchBuf] = React.useState("");
+  const [detail, setDetail] = React.useState<Light | null>(null);
+  const [confirmMsg, setConfirmMsg] = React.useState("");
+  const [confirmCb, setConfirmCb] = React.useState<(() => void) | null>(null);
+  const [status, setStatus] = React.useState("");
+  const [statusT, setStatusT] = React.useState(0);
 
-  if (!stdin.isTTY) { process.stderr.write("TTY required\n"); process.exit(1); }
-  stdin.setRawMode?.(true);
-  stdin.resume();
+  // Create form state
+  const [cContent, setCContent] = React.useState("");
+  const [cCat, setCCat] = React.useState("fact");
+  const [cImp, setCImp] = React.useState("0.5");
+  const [cTags, setCTags] = React.useState("");
+  const [cField, setCField] = React.useState(0);
 
-  let buf = "";
-  let mode: InputMode = "none";
+  const { stdout } = useStdout();
+  const cols = stdout.columns || 80;
 
-  function load() {
-    const opts: Memory.ListOptions = { limit: 500 };
-    if (state.searchQuery) {
-      state.memories = Memory.search(db, state.searchQuery, { limit: 200, min_similarity: 0 }).map(strip);
-    } else {
-      state.memories = Memory.list(db, opts).map(strip);
+  function load(q?: string) {
+    if (q) {
+      setMemories(Memory.search(db, q, { limit: 200, min_similarity: 0 }).map(strip));
+      return;
     }
-    state.cursor = 0; state.offset = 0;
+    setMemories(Memory.list(db, { limit: 500 }).map(strip));
   }
 
-  function strip(e: Memory.Engram): EngramLight {
-    const { embedding: _, ...rest } = e;
-    return rest;
-  }
+  function msg(s: string) { setStatus(s); setStatusT(Date.now()); }
 
-  function msg(s: string) { state.statusMsg = s; state.statusTime = Date.now(); }
+  React.useEffect(() => { load(); }, []);
 
-  function render() {
-    stdout.write(CLEAR + HIDE);
+  // Status timeout
+  React.useEffect(() => {
+    if (!status) return;
+    const t = setTimeout(() => setStatus(""), 3000);
+    return () => clearTimeout(t);
+  }, [status, statusT]);
 
-    // ── Header bar ──
-    stdout.write(BOLD + " OpenMemory " + RST + DIM + "TUI" + RST);
-    stdout.write("  " + DIM);
-    if (state.searchQuery) stdout.write("🔍 " + state.searchQuery + "  ");
-    stdout.write("[↑↓]nav [↵]open [n]new [/]search [d]del [q]quit" + RST + "\n");
+  const headerText = ` OpenMemory${searching ? "  🔍 " + searchBuf : ""}`;
 
-    if (state.statusMsg && Date.now() - state.statusTime < 3000) {
-      stdout.write(" " + state.statusMsg + "\n");
-    }
-    stdout.write(" " + DIM + "─".repeat(Math.min(80, stdout.columns - 2)) + RST + "\n");
-
-    // ── Mode routers ──
-    if (mode.startsWith("create")) { renderCreate(); return; }
-    if (mode === "search") {
-      stdout.write(" Search: " + state.searchQuery + (state.searchQuery.length % 2 === 0 ? "█" : " ") + "\n\n");
-    }
-    if (state.screen === "confirm") {
-      stdout.write("\n " + state.confirmMsg + "\n " + YLW + "(y/n)" + RST + " ");
-      stdout.write(SHOW); return;
-    }
-    if (state.screen === "detail" && state.detailItem) { renderDetail(); return; }
-
-    // ── List ──
-    if (state.memories.length === 0) {
-      stdout.write("\n No memories found.\n\n");
-      stdout.write(" [n] New  [/] Search  [r] Refresh\n");
-      stdout.write(SHOW); return;
-    }
-
-    const rows = stdout.rows - 5;
-    const maxOff = Math.max(0, state.memories.length - rows);
-    state.offset = Math.min(maxOff, Math.max(0, state.offset));
-    if (state.cursor < state.offset) state.offset = state.cursor;
-    if (state.cursor >= state.offset + rows) state.offset = state.cursor - rows + 1;
-
-    const colW = Math.min(80, stdout.columns - 2);
-    const tagW = 10;
-    const impW = 5;
-    const idW = 4;
-    const bodyW = colW - idW - impW - tagW - 5;
-
-    const visible = state.memories.slice(state.offset, state.offset + rows);
-    for (let i = 0; i < visible.length; i++) {
-      const idx = state.offset + i;
-      const m = visible[i]!;
-      const cur = idx === state.cursor;
-
-      const id = String(m.id).padStart(idW);
-      const imp = (m.importance * 100).toFixed(0).padStart(2) + "%";
-      const cat = m.category.substring(0, tagW).padEnd(tagW);
-      const text = preview(m.content, bodyW).padEnd(bodyW);
-
-      if (cur) stdout.write(REV);
-      stdout.write(" " + id + " " + imp + " ");
-      stdout.write(catColor(m.category) + cat + RST);
-      if (cur) stdout.write(REV);
-      stdout.write(" " + text);
-      if (cur) stdout.write(RST);
-      stdout.write("\n");
-    }
-
-    stdout.write(" " + DIM + "─".repeat(colW) + RST + "\n");
-    const pct = state.memories.length > 0 ? (state.offset + 1) + "-" + Math.min(state.offset + rows, state.memories.length) + "/" + state.memories.length : "empty";
-    stdout.write(" " + DIM + pct + RST + "\n");
-    stdout.write(SHOW);
-  }
-
-  function renderCreate() {
-    stdout.write(" New Memory  " + DIM + "[Tab]next  [Enter]save  [Esc]cancel" + RST + "\n");
-
-    const fields: { key: InputMode; label: string; val: string; multi: boolean }[] = [
-      { key: "createContent", label: "Content", val: state.newContent, multi: true },
-      { key: "createCategory", label: "Category", val: state.newCategory, multi: false },
-      { key: "createImportance", label: "Importance", val: state.newImportance, multi: false },
-      { key: "createTags", label: "Tags", val: state.newTags, multi: false },
-    ];
-
-    for (const f of fields) {
-      const active = mode === f.key;
-      if (active) stdout.write(REV);
-      stdout.write(" " + f.label + ": ");
-      if (f.multi) { stdout.write("\n  "); f.val ? stdout.write(f.val) : stdout.write(DIM + "(required)" + RST + (active ? "" : "")); }
-      else { stdout.write(f.val); }
-      if (active) stdout.write("█");
-      if (active) stdout.write(RST);
-      stdout.write("\n");
-      if (f.multi) stdout.write("\n");
-    }
-    stdout.write("\n " + DIM + "Tab to switch, Enter to save, Esc to cancel" + RST + "\n");
-    stdout.write(SHOW);
-  }
-
-  function renderDetail() {
-    const m = state.detailItem!;
-    const cols = Math.min(80, stdout.columns - 2);
-
-    stdout.write(BOLD + " Memory #" + m.id + RST);
-    stdout.write("  " + DIM + "[Esc]back  [d]delete" + RST + "\n\n");
-
-    // Content box
-    const lines = m.content.split("\n").filter(l => !l.startsWith("---"));
-    for (const line of lines.slice(0, 50)) {
-      stdout.write(" " + line.substring(0, cols - 2) + "\n");
-    }
-    if (lines.length > 50) stdout.write(" " + DIM + "..." + (lines.length - 50) + " more lines" + RST + "\n");
-
-    stdout.write("\n " + DIM + "─".repeat(cols) + RST + "\n");
-    stdout.write(" " + (DIM + "ID:" + RST + " " + m.id + "  "));
-    stdout.write(catColor(m.category) + m.category + RST + "  ");
-    stdout.write(DIM + "Importance:" + RST + " " + (m.importance * 100).toFixed(0) + "%  ");
-    stdout.write(DIM + "Project:" + RST + " " + m.project_id + "\n");
-    stdout.write(" " + DIM + "Created:" + RST + " " + (m.created_at || "?") + "\n");
-    if (m.tags?.length) stdout.write(" " + DIM + "Tags:" + RST + " " + m.tags.join(", ") + "\n");
-    if (m.location) stdout.write(" " + DIM + "Location:" + RST + " " + m.location + "\n");
-    stdout.write(SHOW);
-  }
-
-  function cleanup() {
-    stdin.setRawMode?.(false);
-    stdout.write(CLEAR + SHOW);
-  }
-
-  load();
-
-  stdin.on("data", (data: Buffer) => {
-    buf += data.toString();
-
-    while (buf.length > 0) {
-      let key = "";
-      let consumed = 0;
-
-      if (buf[0] === ESC) {
-        if (buf.startsWith(ESC + "[A")) { key = "UP"; consumed = 3; }
-        else if (buf.startsWith(ESC + "[B")) { key = "DOWN"; consumed = 3; }
-        else if (buf.startsWith(ESC + "[C")) { key = "RIGHT"; consumed = 3; }
-        else if (buf.startsWith(ESC + "[D")) { key = "LEFT"; consumed = 3; }
-        else if (buf.startsWith(ESC + "[H")) { key = "HOME"; consumed = 3; }
-        else if (buf.startsWith(ESC + "[F")) { key = "END"; consumed = 3; }
-        else if (buf.startsWith(ESC + "[5~")) { key = "PAGEUP"; consumed = 3; }
-        else if (buf.startsWith(ESC + "[6~")) { key = "PAGEDOWN"; consumed = 3; }
-        else if (buf.startsWith(ESC + "[3~")) { key = "DEL"; consumed = 3; }
-        else if (buf === ESC) { key = "ESC"; consumed = 1; }
-        else { consumed = 1; buf = buf.slice(1); continue; }
-      } else if (buf[0] === "\r" || buf[0] === "\n") { key = "ENTER"; consumed = 1; }
-      else if (buf[0] === "\x7f" || buf[0] === "\b") { key = "BS"; consumed = 1; }
-      else if (buf[0] === "\t") { key = "TAB"; consumed = 1; }
-      else if (buf[0] === "\x03") { key = "CTRLC"; consumed = 1; }
-      else { key = buf[0]!; consumed = 1; }
-
-      buf = buf.slice(consumed);
-
-      // ── Input mode dispatch ──
-      if (mode.startsWith("create")) {
-        if (key === "ESC") { mode = "none"; render(); continue; }
-        if (key === "TAB") {
-          const order: InputMode[] = ["createContent", "createCategory", "createImportance", "createTags"];
-          const i = order.indexOf(mode);
-          mode = order[(i + 1) % order.length]!;
-          render(); continue;
-        }
-        if (key === "ENTER") {
-          if (mode === "createTags") {
-            const imp = parseFloat(state.newImportance);
-            const r = Memory.store(db, state.newContent, {
-              category: state.newCategory || "fact",
-              importance: isNaN(imp) ? 0.5 : imp,
-              tags: state.newTags.split(",").map(t => t.trim()).filter(Boolean),
-            });
-            msg(r.ok ? "Stored #" + r.id : "Failed: " + r.reason);
-            if (r.ok) load();
-            mode = "none"; render(); continue;
-          }
-          const order: InputMode[] = ["createContent", "createCategory", "createImportance", "createTags"];
-          const i = order.indexOf(mode);
-          mode = order[(i + 1) % order.length]!;
-          render(); continue;
-        }
-        if (key === "BS") {
-          if (mode === "createContent") state.newContent = state.newContent.slice(0, -1);
-          else if (mode === "createCategory") state.newCategory = state.newCategory.slice(0, -1);
-          else if (mode === "createImportance") state.newImportance = state.newImportance.slice(0, -1);
-          else if (mode === "createTags") state.newTags = state.newTags.slice(0, -1);
-          render(); continue;
-        }
-        if (key.length === 1) {
-          if (mode === "createContent") state.newContent += key;
-          else if (mode === "createCategory") state.newCategory += key;
-          else if (mode === "createImportance") state.newImportance += key;
-          else if (mode === "createTags") state.newTags += key;
-          render(); continue;
-        }
-        render(); continue;
+  useInput((input, key) => {
+    if (view === "detail" && detail) {
+      if (key.escape) { setView("list"); setDetail(null); return; }
+      if (input === "d") {
+        setConfirmMsg(`Delete memory #${detail.id}?`);
+        setConfirmCb(() => () => { Memory.softDelete(db, detail.id); load(search || undefined); msg(`Deleted #${detail.id}`); });
+        setView("confirm");
       }
-
-      if (mode === "search") {
-        if (key === "ESC" || key === "CTRLC") { mode = "none"; state.searchQuery = ""; load(); render(); continue; }
-        if (key === "ENTER") { mode = "none"; load(); render(); continue; }
-        if (key === "BS") { state.searchQuery = state.searchQuery.slice(0, -1); render(); continue; }
-        if (key.length === 1) { state.searchQuery += key; render(); continue; }
-        render(); continue;
-      }
-
-      if (state.screen === "confirm") {
-        if (key === "y" && state.confirmAction) { state.confirmAction(); }
-        state.screen = "list"; mode = "none"; render(); continue;
-      }
-
-      if (state.screen === "detail") {
-        if (key === "ESC") { state.screen = "list"; render(); continue; }
-        if (key === "d") {
-          const m = state.detailItem!;
-          if (m) {
-            state.confirmMsg = "Delete memory #" + m.id + "?";
-            state.confirmAction = () => { Memory.softDelete(db, m.id); load(); msg("Deleted #" + m.id); };
-            mode = "confirm";
-            state.screen = "confirm";
-            render(); continue;
-          }
-        }
-        if (key === "UP" || key === "DOWN") { } // scroll handled via continue
-        render(); continue;
-      }
-
-      // ── List mode ──
-      switch (key) {
-        case "q": case "ESC": cleanup(); process.exit(0);
-        case "UP": if (state.cursor > 0) state.cursor--; break;
-        case "DOWN": if (state.cursor < state.memories.length - 1) state.cursor++; break;
-        case "PAGEUP": state.cursor = Math.max(0, state.cursor - 15); break;
-        case "PAGEDOWN": state.cursor = Math.min(state.memories.length - 1, state.cursor + 15); break;
-        case "HOME": state.cursor = 0; break;
-        case "END": state.cursor = state.memories.length - 1; break;
-        case "ENTER":
-          if (state.memories[state.cursor]) {
-            state.detailItem = state.memories[state.cursor]!;
-            state.screen = "detail";
-          }
-          break;
-        case "/": mode = "search"; state.searchQuery = ""; break;
-        case "n":
-          mode = "createContent";
-          state.newContent = ""; state.newCategory = "fact"; state.newImportance = "0.5"; state.newTags = "";
-          break;
-        case "d":
-          if (state.memories[state.cursor]) {
-            const m = state.memories[state.cursor]!;
-            state.confirmMsg = "Delete memory #" + m.id + "?";
-            state.confirmAction = () => { Memory.softDelete(db, m.id); load(); msg("Deleted #" + m.id); };
-            state.screen = "confirm"; mode = "confirm";
-          }
-          break;
-        case "r": load(); msg("Refreshed"); break;
-      }
-      render();
+      return;
     }
+
+    if (view === "confirm") {
+      if (input === "y" && confirmCb) { confirmCb(); }
+      setView("list");
+      return;
+    }
+
+    if (view === "create") {
+      if (key.escape) { setView("list"); return; }
+      if (key.tab) { setCField((cField + 1) % 4); return; }
+      if (key.return) {
+        if (cField === 3) {
+          const imp = parseFloat(cImp);
+          const r = Memory.store(db, cContent, {
+            category: cCat || "fact",
+            importance: isNaN(imp) ? 0.5 : imp,
+            tags: cTags.split(",").map(t => t.trim()).filter(Boolean),
+          });
+          if (r.ok) { msg(`Stored #${r.id}`); load(); }
+          else { msg("Failed: " + r.reason); }
+          setView("list");
+          return;
+        }
+        setCField((cField + 1) % 4);
+        return;
+      }
+      if (key.backspace || key.delete) {
+        if (cField === 0) setCContent(cContent.slice(0, -1));
+        else if (cField === 1) setCCat(cCat.slice(0, -1));
+        else if (cField === 2) setCImp(cImp.slice(0, -1));
+        else if (cField === 3) setCTags(cTags.slice(0, -1));
+        return;
+      }
+      if (input && input.length === 1) {
+        if (cField === 0) setCContent(cContent + input);
+        else if (cField === 1) setCCat(cCat + input);
+        else if (cField === 2) setCImp(cImp + input);
+        else if (cField === 3) setCTags(cTags + input);
+      }
+      return;
+    }
+
+    if (searching) {
+      if (key.escape) { setSearching(false); setSearchBuf(""); load(); return; }
+      if (key.return) { setSearch(searchBuf); setSearching(false); load(searchBuf); return; }
+      if (key.backspace || key.delete) { setSearchBuf(searchBuf.slice(0, -1)); return; }
+      if (input && input.length === 1) { setSearchBuf(searchBuf + input); }
+      return;
+    }
+
+    // List mode
+    if (input === "q") process.exit(0);
+    if (key.upArrow && cursor > 0) setCursor(cursor - 1);
+    if (key.downArrow && cursor < memories.length - 1) setCursor(cursor + 1);
+    if (key.pageUp) setCursor(Math.max(0, cursor - Math.floor(stdout.rows! * 0.6)));
+    if (key.pageDown) setCursor(Math.min(memories.length - 1, cursor + Math.floor(stdout.rows! * 0.6)));
+    if (key.return && memories[cursor]) { setDetail(memories[cursor]!); setView("detail"); }
+    if (input === "/") { setSearching(true); setSearchBuf(""); }
+    if (input === "n") {
+      setCContent(""); setCCat("fact"); setCImp("0.5"); setCTags(""); setCField(0);
+      setView("create");
+    }
+    if (input === "d" && memories[cursor]) {
+      const m = memories[cursor]!;
+      setConfirmMsg(`Delete memory #${m.id}?`);
+      setConfirmCb(() => () => { Memory.softDelete(db, m.id); load(search || undefined); msg(`Deleted #${m.id}`); });
+      setView("confirm");
+    }
+    if (input === "r") { load(search || undefined); msg("Refreshed"); }
   });
 
-  render();
+  const rows = Math.max(stdout.rows! - 5, 5);
+  const maxOff = Math.max(0, memories.length - rows);
+  const offset = Math.min(maxOff, Math.max(0, cursor - Math.floor(rows / 2)));
+  const vis = memories.slice(offset, offset + rows);
+
+  const r = 255; // key
+
+  return React.createElement(Box, { flexDirection: "column", height: "100%" },
+    // Header
+    React.createElement(Box, { height: 1, backgroundColor: "#6366f1" },
+      React.createElement(Text, { bold: true, color: "white" }, headerText),
+    ),
+    // Status
+    status ? React.createElement(Box, { height: 1 },
+      React.createElement(Text, { color: "#4ade80" }, ` ${status}`),
+    ) : null,
+    // Search
+    searching ? React.createElement(Box, { height: 1, paddingLeft: 1 },
+      React.createElement(Text, null, `Search: ${searchBuf}`),
+    ) : null,
+
+    // Main content
+    view === "detail" && detail ? React.createElement(Box, { flexDirection: "column", paddingX: 1, overflowY: "auto" as const },
+      React.createElement(Text, { bold: true }, ` Memory #${detail.id}`),
+      React.createElement(Box, { height: 1 }),
+      React.createElement(Text, { color: "#71717a" }, ` ${detail.content.split("\n").slice(0, 50).join("\n ")}`),
+      React.createElement(Box, { height: 1 }),
+      React.createElement(Text, null, ` Category: `, React.createElement(Text, { color: catColor(detail.category) }, detail.category)),
+      React.createElement(Text, null, ` Importance: ${(detail.importance * 100).toFixed(0)}%`),
+      React.createElement(Text, null, ` Project: ${detail.project_id}`),
+      React.createElement(Text, null, ` Created: ${detail.created_at || "?"}`),
+      detail.tags?.length ? React.createElement(Text, null, ` Tags: ${detail.tags.join(", ")}`) : null,
+      detail.location ? React.createElement(Text, null, ` Location: ${detail.location}`) : null,
+      React.createElement(Box, { height: 1 }),
+      React.createElement(Text, { dimColor: true }, " [Esc] back  [d] delete"),
+    ) :
+
+    view === "confirm" ? React.createElement(Box, { paddingX: 1 },
+      React.createElement(Text, { color: "#ef4444" }, ` ${confirmMsg}  (y/n)`),
+    ) :
+
+    view === "create" ? React.createElement(Box, { flexDirection: "column", paddingX: 1 },
+      React.createElement(Text, { bold: true }, " New Memory  [Tab]next  [Enter]save  [Esc]cancel"),
+      React.createElement(Box, { height: 1 }),
+      ...[
+        { label: "Content", val: cContent },
+        { label: "Category", val: cCat },
+        { label: "Importance", val: cImp },
+        { label: "Tags", val: cTags },
+      ].map((f, i) =>
+        React.createElement(Box, { key: f.label },
+          React.createElement(Text, { inverse: i === cField }, ` ${f.label}: `),
+          React.createElement(Text, { inverse: i === cField }, f.val || (i === 0 ? "(required)" : "")),
+        )
+      ),
+      React.createElement(Text, { dimColor: true }, " Tab to switch, Enter to save, Esc to cancel"),
+    ) :
+
+    // List
+    React.createElement(Box, { flexDirection: "column", flexGrow: 1 },
+      vis.length === 0 ?
+        React.createElement(Box, { paddingX: 1 },
+          React.createElement(Text, { color: "#52525b" }, " No memories found"),
+        ) :
+        vis.map((m, i) => {
+          const idx = offset + i;
+          const cur = idx === cursor;
+          const imp = (m.importance * 100).toFixed(0).padStart(2);
+          const cat = m.category.substring(0, 12).padEnd(12);
+          const body = preview(m.content, Math.max(cols - 40, 20));
+          return React.createElement(Box, { key: m.id },
+            React.createElement(Text, { inverse: cur },
+              ` ${String(m.id).padStart(4)} ${imp}% `,
+              React.createElement(Text, { color: catColor(m.category) }, cat),
+              ` ${body}`,
+            ),
+          );
+        }),
+    ),
+
+    // Footer
+    React.createElement(Box, { height: 1, backgroundColor: "#18181b" },
+      React.createElement(Text, { color: "#71717a" },
+        ` ${memories.length} memories`,
+        search ? `  🔍 ${search}` : "",
+      ),
+    ),
+  );
 }
+
+// Standalone entry point — run with: bun run src/tui.ts
+const dbPath = process.env.OPENMEMORY_DB_PATH;
+if (!dbPath) {
+  process.stderr.write("OPENMEMORY_DB_PATH not set\n");
+  process.exit(1);
+}
+const db = Memory.openDb(dbPath);
+const { waitUntilExit } = render(React.createElement(App, { db }));
+waitUntilExit();
