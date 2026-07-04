@@ -5,7 +5,7 @@ import { mkdirSync } from "node:fs";
 import { serve } from "./server.js";
 import { openDb } from "./memory.js";
 import * as Tools from "./tools.js";
-import { startWebServer } from "./web-server.js";
+import { startTui } from "./tui.js";
 import type { Database } from "bun:sqlite";
 
 function main(): void {
@@ -25,9 +25,8 @@ function main(): void {
   ensureDir(dbPath);
   const db = openDb(dbPath);
 
-  if (args[0] === "web") {
-    const port = parseInt(args[1] || "3030", 10);
-    startWebServer(db, port);
+  if (args[0] === "tui") {
+    startTui(db);
     return;
   }
 
@@ -136,14 +135,13 @@ openmemory — persistent memory MCP server
 
 USAGE
   openmemory                          start MCP stdio loop
-  openmemory web [port]               start Web UI (default port 3030)
+  openmemory tui                      interactive TUI (memory manager)
   openmemory <tool> <op> [args...]    CLI mode (run once and exit)
   openmemory --version
   openmemory --help
 
 CLI EXAMPLES
-  openmemory web
-  openmemory web 8080
+  openmemory tui
   openmemory memory search "query text"
   openmemory memory store "content here" category=fact importance=0.8
   openmemory memory list limit=10
