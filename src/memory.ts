@@ -8,6 +8,7 @@
 import { Database } from "bun:sqlite";
 
 import * as Embedder from "./embedder.js";
+import * as Originals from "./originals.js";
 import * as Procedural from "./procedural.js";
 import type {
   Engram,
@@ -27,8 +28,6 @@ PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS engrams (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   content TEXT NOT NULL,
-  original TEXT,
-  location TEXT,
   category TEXT NOT NULL DEFAULT 'fact',
   importance REAL NOT NULL DEFAULT 0.5,
   embedding TEXT NOT NULL DEFAULT '[]',
@@ -80,8 +79,6 @@ CREATE TABLE IF NOT EXISTS corpus_stats (
 type Row = {
   id: number;
   content: string;
-  original: string | null;
-  location: string | null;
   category: string;
   importance: number;
   embedding: string;
@@ -103,8 +100,6 @@ function rowToEngram(r: Row): Engram {
   return {
     id: r.id,
     content: r.content,
-    original: r.original,
-    location: r.location,
     category: r.category,
     importance: r.importance,
     embedding: JSON.parse(r.embedding) as number[],
@@ -130,26 +125,56 @@ function rowToEngram(r: Row): Engram {
 export function openDb(path: string): Database {
   const db = new Database(path, { create: true });
   db.exec(SCHEMA);
-  migrateEngrams(db);
-  initCorpusStats(db);
-  Procedural.seedDefaults(db);
+  // Schema migration is async because the legacy → per-id originals layout
+  // needs to copy files on disk. openDb is therefore async; callers (server
+  // boot, TUI entry, tests) await it.
   return db;
 }
 
 /**
- * Idempotent column additions for databases created before newer schema fields.
- * SQLite has no `ADD COLUMN IF NOT EXISTS`, so probe pragma_table_info.
+ * Run all one-shot migrations against `db`.
+ *
+ *   1. Move legacy `originals/<name>` files into the per-id scheme.
+ *   2. Drop the now-unused `original` and `location` columns.
+ *
+ * Order matters: we need `location` to still be readable while we move
+ * files, and we can't drop columns inside a transaction that touches the
+ * data we just read.
+ */
+export async function runMigrations(db: Database): Promise<void> {
+  await Originals.migrateLegacyOriginals(db);
+  migrateEngrams(db);
+  initCorpusStats(db);
+  Procedural.seedDefaults(db);
+}
+
+/**
+ * Idempotent schema changes for databases created before the current layout.
+ *
+ *   - Drops `original` (was never used as an input; the content column
+ *     already holds the verbatim text).
+ *   - Drops `location` (sources now live under `originals/<id>/`,
+ *     derivable from the id alone).
  */
 function migrateEngrams(db: Database): void {
   const cols = db
     .prepare("PRAGMA table_info(engrams)")
     .all() as Array<{ name: string }>;
   const have = new Set(cols.map((c) => c.name));
-  if (!have.has("original")) {
-    db.exec("ALTER TABLE engrams ADD COLUMN original TEXT");
+  // SQLite 3.35+ supports `ALTER TABLE ... DROP COLUMN`. Older versions
+  // would error; bail silently if the column is already gone.
+  if (have.has("location")) {
+    try {
+      db.exec("ALTER TABLE engrams DROP COLUMN location");
+    } catch {
+      // Pre-3.35 sqlite: leave the column in place. New code never writes
+      // to it, but legacy readers will still see it.
+    }
   }
-  if (!have.has("location")) {
-    db.exec("ALTER TABLE engrams ADD COLUMN location TEXT");
+  if (have.has("original")) {
+    try {
+      db.exec("ALTER TABLE engrams DROP COLUMN original");
+    } catch {}
   }
 }
 
@@ -238,14 +263,12 @@ export function store(
 
   const stmt = db.prepare(`
     INSERT INTO engrams
-      (content, original, location, category, importance, embedding, embedding_dim,
+      (content, category, importance, embedding, embedding_dim,
        metadata, tags, project_id, valid_from, valid_until)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   const info = stmt.run(
     text,
-    opts.original ?? null,
-    opts.location ?? null,
     opts.category ?? "fact",
     importance,
     JSON.stringify(embedding),
@@ -360,6 +383,120 @@ export function softDelete(
   const info = db.prepare("UPDATE engrams SET archived = 1, updated_at = datetime('now') WHERE id = ?").run(id);
   if (info.changes === 0) return { ok: false, reason: "not_found" };
   return { ok: true };
+}
+
+/**
+ * Update mutable fields on a single engram. Only fields present in `patch`
+ * are touched; everything else is left as-is.
+ *
+ * Recognised keys: `importance` (0..1, clamped), `category`, `tags`,
+ * `metadata`, `project_id`, `content` (with `embedding`), `embedding`.
+ *
+ * Note: `original` and `location` are NOT settable. Source files live in
+ * `originals/<id>/` and are managed entirely by the ingest path. To replace
+ * a memory's source, supersede it.
+ *
+ * Content-editing rules:
+ *   - If `content` is provided, the new text is trimmed and must be non-empty.
+ *   - If `content` is provided, a new `embedding` vector MUST also be supplied
+ *     (this server never calls an embedding model on its own). Failing to do
+ *     so returns `"embedding_required"` so the caller knows the embedding
+ *     for the old content is now stale.
+ *   - If the new content matches another active engram, returns
+ *     `"duplicate_content"` — the caller should supersede instead.
+ *   - `embedding` may be supplied without `content` to re-embed an unchanged
+ *     memory (e.g. after `reindex` style operations).
+ */
+export function update(
+  db: Database,
+  id: number,
+  patch: {
+    content?: string;
+    embedding?: number[];
+    importance?: number;
+    category?: string;
+    tags?: string[];
+    metadata?: Record<string, unknown>;
+    project_id?: string;
+  },
+):
+  | { ok: true; engram: Engram }
+  | { ok: false; reason: "not_found" }
+  | { ok: false; reason: "empty_patch" }
+  | { ok: false; reason: "invalid_importance" }
+  | { ok: false; reason: "empty_content" }
+  | { ok: false; reason: "embedding_required" }
+  | { ok: false; reason: "duplicate_content" } {
+  const sets: string[] = [];
+  const params: (string | number | null)[] = [];
+
+  // content + embedding: must move together.
+  if (patch.content !== undefined) {
+    const text = patch.content.trim();
+    if (text === "") return { ok: false, reason: "empty_content" };
+    if (patch.embedding === undefined) {
+      return { ok: false, reason: "embedding_required" };
+    }
+    const dup = findByContent(db, text);
+    if (dup && dup.id !== id) {
+      return { ok: false, reason: "duplicate_content" };
+    }
+    sets.push("content = ?");
+    params.push(text);
+    sets.push("embedding = ?");
+    params.push(JSON.stringify(patch.embedding));
+    sets.push("embedding_dim = ?");
+    params.push(patch.embedding.length);
+  } else if (patch.embedding !== undefined) {
+    // Re-embed without changing content.
+    sets.push("embedding = ?");
+    params.push(JSON.stringify(patch.embedding));
+    sets.push("embedding_dim = ?");
+    params.push(patch.embedding.length);
+  }
+
+  if (patch.importance !== undefined) {
+    if (!Number.isFinite(patch.importance)) {
+      return { ok: false, reason: "invalid_importance" };
+    }
+    sets.push("importance = ?");
+    params.push(clamp01(patch.importance));
+  }
+  if (patch.category !== undefined) {
+    sets.push("category = ?");
+    params.push(patch.category);
+  }
+  if (patch.tags !== undefined) {
+    sets.push("tags = ?");
+    params.push(JSON.stringify(patch.tags));
+  }
+  if (patch.metadata !== undefined) {
+    sets.push("metadata = ?");
+    params.push(JSON.stringify(patch.metadata));
+  }
+  if (patch.project_id !== undefined) {
+    sets.push("project_id = ?");
+    params.push(patch.project_id);
+  }
+
+  if (sets.length === 0) return { ok: false, reason: "empty_patch" };
+
+  sets.push("updated_at = datetime('now')");
+  params.push(id);
+
+  const info = db
+    .prepare(`UPDATE engrams SET ${sets.join(", ")} WHERE id = ?`)
+    .run(...params);
+  if (info.changes === 0) {
+    // Either id doesn't exist or the patch equals the current values.
+    // Disambiguate by re-fetching.
+    const existing = get(db, id);
+    if (!existing) return { ok: false, reason: "not_found" };
+  }
+
+  const engram = get(db, id);
+  if (!engram) return { ok: false, reason: "not_found" };
+  return { ok: true, engram };
 }
 
 /** Hard delete. Use sparingly. */

@@ -3,8 +3,6 @@
 export type Engram = {
   id: number;
   content: string;
-  original: string | null;
-  location: string | null;
   category: string;
   importance: number;
   embedding: number[];
@@ -62,8 +60,6 @@ export type StoreOptions = {
   valid_until?: string | Date | null;
   dimensions?: number;
   embedding?: number[];
-  original?: string;
-  location?: string;
 };
 
 export type SearchOptions = {

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { unlinkSync, existsSync } from "node:fs";
+import { rmSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -7,19 +7,27 @@ import * as Procedural from "../src/procedural.ts";
 import * as Memory from "../src/memory.ts";
 
 let dbPath: string;
+let originalsDir: string;
 let db: ReturnType<typeof Memory.openDb>;
 
-beforeEach(() => {
+beforeEach(async () => {
   dbPath = join(tmpdir(), `openmemory_proc_${Date.now()}_${Math.random().toString(36).slice(2)}.db`);
+  originalsDir = join(tmpdir(), `openmemory_orig_${Date.now()}_${Math.random().toString(36).slice(2)}`);
+  process.env.OPENMEMORY_ORIGINALS_DIR = originalsDir;
   db = Memory.openDb(dbPath);
+  await Memory.runMigrations(db);
 });
 
 afterEach(() => {
   db.close();
   for (const ext of ["", "-wal", "-shm"]) {
     const p = dbPath + ext;
-    if (existsSync(p)) try { unlinkSync(p); } catch {}
+    if (existsSync(p)) try { rmSync(p, { force: true }); } catch {}
   }
+  if (existsSync(originalsDir)) {
+    try { rmSync(originalsDir, { recursive: true, force: true }); } catch {}
+  }
+  delete process.env.OPENMEMORY_ORIGINALS_DIR;
 });
 
 describe("procedural.register", () => {

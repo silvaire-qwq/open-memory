@@ -1,27 +1,36 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { unlinkSync, existsSync } from "node:fs";
+import { unlinkSync, existsSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 
 import * as Tools from "../src/tools.ts";
 import * as Memory from "../src/memory.ts";
 import * as Procedural from "../src/procedural.ts";
 import * as Embedder from "../src/embedder.ts";
+import * as Originals from "../src/originals.ts";
 
 let dbPath: string;
+let originalsDir: string;
 let db: ReturnType<typeof Memory.openDb>;
 
-beforeEach(() => {
+beforeEach(async () => {
   dbPath = join(tmpdir(), `openmemory_tools_${Date.now()}_${Math.random().toString(36).slice(2)}.db`);
+  originalsDir = join(tmpdir(), `openmemory_orig_${Date.now()}_${Math.random().toString(36).slice(2)}`);
+  process.env.OPENMEMORY_ORIGINALS_DIR = originalsDir;
   db = Memory.openDb(dbPath);
+  await Memory.runMigrations(db);
 });
 
 afterEach(() => {
   db.close();
   for (const ext of ["", "-wal", "-shm"]) {
     const p = dbPath + ext;
-    if (existsSync(p)) try { unlinkSync(p); } catch {}
+    if (existsSync(p)) try { rmSync(p, { force: true }); } catch {}
   }
+  if (existsSync(originalsDir)) {
+    try { rmSync(originalsDir, { recursive: true, force: true }); } catch {}
+  }
+  delete process.env.OPENMEMORY_ORIGINALS_DIR;
 });
 
 describe("tools.memory", () => {
@@ -93,6 +102,88 @@ describe("tools.memory", () => {
     }
   });
 
+  test("update re-weights an existing memory", () => {
+    const s = Tools.memory(db, { operation: "store", content: "weighted" });
+    expect(s.ok).toBe(true);
+    if (!s.ok || s.payload.kind !== "memory_store") return;
+    const id = s.payload.id;
+
+    const up = Tools.memory(db, {
+      operation: "update",
+      id,
+      importance: 0.95,
+      category: "preference",
+    });
+    expect(up.ok).toBe(true);
+    if (up.ok && up.payload.kind === "memory_update") {
+      expect(up.payload.engram.importance).toBeCloseTo(0.95, 6);
+      expect(up.payload.engram.category).toBe("preference");
+      expect(up.payload.patched).toEqual(expect.arrayContaining(["importance", "category"]));
+    }
+
+    const got = Tools.memory(db, { operation: "get", id });
+    expect(got.ok).toBe(true);
+    if (got.ok && got.payload.kind === "memory_get") {
+      expect(got.payload.engram.importance).toBeCloseTo(0.95, 6);
+    }
+  });
+
+  test("update with no patch fields returns an error", () => {
+    const s = Tools.memory(db, { operation: "store", content: "x" });
+    if (!s.ok || s.payload.kind !== "memory_store") return;
+    const r = Tools.memory(db, { operation: "update", id: s.payload.id });
+    expect(r.ok).toBe(false);
+  });
+
+  test("update for missing id returns not_found", () => {
+    const r = Tools.memory(db, { operation: "update", id: 99999, importance: 0.1 });
+    expect(r.ok).toBe(false);
+  });
+
+  test("update content requires embedding", () => {
+    const s = Tools.memory(db, { operation: "store", content: "to be rewritten" });
+    if (!s.ok || s.payload.kind !== "memory_store") return;
+    const r = Tools.memory(db, {
+      operation: "update",
+      id: s.payload.id,
+      content: "rewritten text",
+    });
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      const reason = (r.error as { reason?: string }).reason ?? "";
+      expect(reason).toContain("embedding");
+    }
+  });
+
+  test("update content with embedding succeeds and patches content", () => {
+    const s = Tools.memory(db, { operation: "store", content: "before" });
+    if (!s.ok || s.payload.kind !== "memory_store") return;
+    const vec = new Array(8).fill(0);
+    vec[1] = 1;
+    const r = Tools.memory(db, {
+      operation: "update",
+      id: s.payload.id,
+      content: "after",
+      embedding: vec,
+    });
+    expect(r.ok).toBe(true);
+    if (r.ok && r.payload.kind === "memory_update") {
+      expect(r.payload.engram.content).toBe("after");
+      expect(r.payload.patched).toEqual(expect.arrayContaining(["content", "embedding"]));
+    }
+  });
+
+  test("update rejects non-finite embedding values", () => {
+    const s = Tools.memory(db, { operation: "store", content: "x" });
+    if (!s.ok || s.payload.kind !== "memory_store") return;
+    const r = Tools.memory(db, {
+      operation: "update",
+      id: s.payload.id,
+      embedding: [Number.NaN],
+    });
+    expect(r.ok).toBe(false);
+  });
+
   test("rejects non-finite embedding values on store", () => {
     const r = Tools.memory(db, {
       operation: "store",
@@ -147,6 +238,27 @@ describe("tools.ingest", () => {
       path: "/no/such/path/exists",
     });
     expect(r.ok).toBe(false);
+  });
+
+  test("file mode copies source into originals/<id>/", async () => {
+    const srcPath = join(tmpdir(), `openmemory_src_${Date.now()}.md`);
+    await Bun.write(srcPath, "source body for originals");
+    const r = await Tools.ingest(db, {
+      operation: "file",
+      path: srcPath,
+    });
+    expect(r.ok).toBe(true);
+    if (r.ok && r.payload.kind === "ingest") {
+      const root = Originals.originalsRoot(db);
+      const destDir = Originals.originalsDirFor(root, r.payload.id);
+      const copied = join(destDir, basename(srcPath));
+      const file = Bun.file(copied);
+      expect(await file.exists()).toBe(true);
+      expect(await file.text()).toBe("source body for originals");
+      // Cleanup.
+      try { unlinkSync(srcPath); } catch {}
+      try { rmSync(destDir, { recursive: true, force: true }); } catch {}
+    }
   });
 });
 

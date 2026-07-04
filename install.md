@@ -79,6 +79,16 @@ After starting, call:
 |---|---|---|
 | `OPENMEMORY_DB_PATH` | `$XDG_DATA_HOME/openmemory/openmemory.db` | SQLite database file |
 | `OPENMEMORY_DIM` | `256` | Embedding dimension (16–4096) |
+| `OPENMEMORY_ORIGINALS_DIR` | sibling of the db file | Override the `originals/` root |
+
+## Source files
+
+Every memory's source lives at `originals/<id>/` next to the database. The
+`ingest file` tool copies the source there automatically — single file or
+recursive folder mirror — so you never specify a `location` field.
+
+- `ingest file /path/to/notes.md` → `originals/<id>/notes.md`
+- `ingest file /path/to/folder` → `originals/<id>/folder/<recursive contents>`
 
 ## Tools
 
@@ -88,6 +98,7 @@ After starting, call:
 - `list` — paginated recent memories
 - `get` — fetch by id
 - `delete` — soft-delete
+- `update` — patch importance/category/project_id/tags/metadata/content+embedding
 - `stats` — corpus stats
 - `chain` — view version chain (supersession history)
 - `supersede` — link old_id → new_id
@@ -96,7 +107,7 @@ After starting, call:
 
 ### ingest
 - `text` — store inline text
-- `file` — read file from disk and store
+- `file` — copy a file or folder into `originals/<id>/` and store content
 
 ### procedures
 - `list` — list registered procedures

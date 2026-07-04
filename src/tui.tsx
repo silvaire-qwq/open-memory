@@ -146,7 +146,7 @@ function strip(e: Engram): Light {
     return r;
 }
 
-type Screen = "list" | "search" | "detail" | "create" | "confirm";
+type Screen = "list" | "search" | "detail" | "create" | "confirm" | "edit_importance";
 
 // Context-sensitive footer hints — one line, changes with `screen`, so we
 // never show two different sets of key hints (one global, one embedded in
@@ -156,7 +156,6 @@ const FOOTER_HINTS: Record<Screen, [string, string][]> = {
         ["↑↓", "nav"],
         ["↵", "open"],
         ["/", "search"],
-        ["n", "new"],
         ["d", "delete"],
         ["r", "refresh"],
         ["q", "quit"],
@@ -167,8 +166,9 @@ const FOOTER_HINTS: Record<Screen, [string, string][]> = {
     ],
     detail: [
         ["↑↓/j/k", "scroll"],
-        ["esc", "back"],
+        ["i", "weight"],
         ["d", "delete"],
+        ["esc", "back"],
         ["q", "quit"],
     ],
     create: [
@@ -179,6 +179,10 @@ const FOOTER_HINTS: Record<Screen, [string, string][]> = {
     confirm: [
         ["y", "yes"],
         ["n", "no"],
+        ["esc", "cancel"],
+    ],
+    edit_importance: [
+        ["↵", "apply"],
         ["esc", "cancel"],
     ],
 };
@@ -264,6 +268,46 @@ function ConfirmDialog({ msg, width }: { msg: string; width: number }) {
         { paddingX: 1, paddingY: 1, flexDirection: "column" },
         React.createElement(Text, { color: THEME.dim }, rule(inner)),
         React.createElement(Text, { color: THEME.text }, msg),
+    );
+}
+
+function EditImportanceView({
+    current,
+    value,
+    width,
+}: {
+    current: number;
+    value: string;
+    width: number;
+}) {
+    const inner = Math.max(10, width - 2);
+    return React.createElement(
+        Box,
+        { flexDirection: "column", paddingX: 1, paddingY: 1 },
+        React.createElement(Text, { color: THEME.accent }, "edit importance"),
+        React.createElement(Text, { dimColor: true }, rule(inner)),
+        React.createElement(
+            Text,
+            null,
+            React.createElement(Text, { color: THEME.dim }, "current  "),
+            React.createElement(
+                Text,
+                { color: THEME.text },
+                `${(current * 100).toFixed(0)}%`,
+            ),
+        ),
+        React.createElement(
+            Box,
+            { height: 1, marginY: 1 },
+            React.createElement(Text, { color: THEME.dim }, "new value  "),
+            React.createElement(Text, { color: THEME.accent }, value || "0"),
+            React.createElement(Text, { color: THEME.accent, dimColor: true }, "▏"),
+        ),
+        React.createElement(
+            Text,
+            { color: THEME.dim },
+            "enter a number 0..1 (e.g. 0.9 = 90%)",
+        ),
     );
 }
 
@@ -367,18 +411,6 @@ function DetailView({
                   ),
               )
             : null,
-        item.location
-            ? React.createElement(
-                  Text,
-                  null,
-                  React.createElement(Text, { color: THEME.dim }, "location  "),
-                  React.createElement(
-                      Text,
-                      { color: THEME.text },
-                      item.location,
-                  ),
-              )
-            : null,
     );
 }
 
@@ -403,6 +435,7 @@ function App({ db }: { db: ReturnType<typeof Memory.openDb> }) {
     const [confirmMsg, setConfirmMsg] = useState("");
     const [confirmCb, setConfirmCb] = useState<(() => void) | null>(null);
     const [prevScreen, setPrevScreen] = useState<Screen>("list");
+    const [eImp, setEImp] = useState("");
 
     const [status, setStatus] = useState("");
     const statusTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -476,7 +509,6 @@ function App({ db }: { db: ReturnType<typeof Memory.openDb> }) {
     const detailFixedRows =
         12 +
         (detail?.tags?.length ? 1 : 0) +
-        (detail?.location ? 1 : 0) +
         CHROME_ROWS;
     const detailContentHeight = Math.max(3, termRows - detailFixedRows);
 
@@ -495,6 +527,11 @@ function App({ db }: { db: ReturnType<typeof Memory.openDb> }) {
                 if (key.escape) {
                     setScreen("list");
                     setDetail(null);
+                    return;
+                }
+                if (input === "i" && detail) {
+                    setEImp(detail.importance.toFixed(2));
+                    setScreen("edit_importance");
                     return;
                 }
                 if (input === "d" && detail) askDelete(detail, "detail");
@@ -567,6 +604,49 @@ function App({ db }: { db: ReturnType<typeof Memory.openDb> }) {
                 if (input && input.length === 1) setSq((s) => s + input);
                 return;
 
+            case "edit_importance":
+                if (input === "q") {
+                    process.exit(0);
+                    return;
+                }
+                if (key.escape) {
+                    setEImp("");
+                    setScreen("detail");
+                    return;
+                }
+                if (key.return && detail) {
+                    const n = Number(eImp);
+                    if (Number.isFinite(n) && n >= 0 && n <= 1) {
+                        const r = Memory.update(db, detail.id, { importance: n });
+                        if (r.ok) {
+                            setDetail(r.engram);
+                            setItems((arr) =>
+                                arr.map((x) =>
+                                    x.id === r.engram.id ? strip(r.engram) : x,
+                                ),
+                            );
+                            msg(`#${detail.id} importance → ${(n * 100).toFixed(0)}%`);
+                            setEImp("");
+                            setScreen("detail");
+                        } else {
+                            msg(`update failed: ${r.reason}`);
+                        }
+                    } else {
+                        msg("importance must be a number 0..1");
+                    }
+                    return;
+                }
+                if (key.backspace || key.delete) {
+                    setEImp((s) => s.slice(0, -1));
+                    return;
+                }
+                if (input && input.length === 1) {
+                    if (input === "." || (input >= "0" && input <= "9")) {
+                        setEImp((s) => s + input);
+                    }
+                }
+                return;
+
             case "create":
                 if (key.escape) {
                     setScreen("list");
@@ -626,14 +706,6 @@ function App({ db }: { db: ReturnType<typeof Memory.openDb> }) {
             setScreen("search");
             setSq("");
         }
-        if (input === "n") {
-            setCc("");
-            setCCat("fact");
-            setCImp("0.5");
-            setCTags("");
-            setCFocus(0);
-            setScreen("create");
-        }
         if (input === "d" && items[idx]) askDelete(items[idx]!, "list");
         if (input === "r") {
             load();
@@ -687,6 +759,14 @@ function App({ db }: { db: ReturnType<typeof Memory.openDb> }) {
                   width: termCols,
                   contentHeight: detailContentHeight,
                   scroll: detailScroll,
+              })
+            : null,
+
+        screen === "edit_importance" && detail
+            ? React.createElement(EditImportanceView, {
+                  current: detail.importance,
+                  value: eImp,
+                  width: termCols,
               })
             : null,
 
@@ -800,5 +880,12 @@ if (import.meta.main) {
         process.stderr.write("OPENMEMORY_DB_PATH not set\n");
         process.exit(1);
     }
-    startTui(Memory.openDb(p));
+    (async () => {
+        const db = Memory.openDb(p);
+        await Memory.runMigrations(db);
+        startTui(db);
+    })().catch((err) => {
+        process.stderr.write(`tui boot failed: ${(err as Error).message}\n`);
+        process.exit(1);
+    });
 }

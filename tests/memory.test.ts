@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { unlinkSync, existsSync } from "node:fs";
+import { rmSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -7,11 +7,15 @@ import * as Memory from "../src/memory.ts";
 import * as Embedder from "../src/embedder.ts";
 
 let dbPath: string;
+let originalsDir: string;
 let db: ReturnType<typeof Memory.openDb>;
 
-beforeEach(() => {
+beforeEach(async () => {
   dbPath = join(tmpdir(), `openmemory_test_${Date.now()}_${Math.random().toString(36).slice(2)}.db`);
+  originalsDir = join(tmpdir(), `openmemory_orig_${Date.now()}_${Math.random().toString(36).slice(2)}`);
+  process.env.OPENMEMORY_ORIGINALS_DIR = originalsDir;
   db = Memory.openDb(dbPath);
+  await Memory.runMigrations(db);
 });
 
 afterEach(() => {
@@ -20,10 +24,14 @@ afterEach(() => {
     const p = dbPath + ext;
     if (existsSync(p)) {
       try {
-        unlinkSync(p);
+        rmSync(p, { force: true });
       } catch {}
     }
   }
+  if (existsSync(originalsDir)) {
+    try { rmSync(originalsDir, { recursive: true, force: true }); } catch {}
+  }
+  delete process.env.OPENMEMORY_ORIGINALS_DIR;
 });
 
 describe("memory.store", () => {
@@ -89,6 +97,139 @@ describe("memory.store", () => {
       const e = Memory.get(db, r.id);
       expect(e?.embedding).toEqual(vec);
       expect(e?.embedding_dim).toBe(384);
+    }
+  });
+});
+
+describe("memory.update (re-weight)", () => {
+  test("updates importance and clamps to 0..1", () => {
+    const r = Memory.store(db, "to be reweighted", { importance: 0.5 });
+    if (!r.ok) throw new Error("seed");
+    const up1 = Memory.update(db, r.id, { importance: 2.5 });
+    expect(up1.ok).toBe(true);
+    if (up1.ok) expect(up1.engram.importance).toBe(1);
+
+    const up2 = Memory.update(db, r.id, { importance: -0.5 });
+    expect(up2.ok).toBe(true);
+    if (up2.ok) expect(up2.engram.importance).toBe(0);
+  });
+
+  test("updates category, project_id, tags, metadata together", () => {
+    const r = Memory.store(db, "multi patch", { category: "fact" });
+    if (!r.ok) throw new Error("seed");
+    const up = Memory.update(db, r.id, {
+      category: "preference",
+      project_id: "alpha",
+      tags: ["x", "y"],
+      metadata: { source: "tui" },
+    });
+    expect(up.ok).toBe(true);
+    if (up.ok) {
+      expect(up.engram.category).toBe("preference");
+      expect(up.engram.project_id).toBe("alpha");
+      expect(up.engram.tags).toEqual(["x", "y"]);
+      expect(up.engram.metadata).toEqual({ source: "tui" });
+    }
+  });
+
+  test("returns not_found for unknown id", () => {
+    const r = Memory.update(db, 99999, { importance: 0.5 });
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toBe("not_found");
+  });
+
+  test("returns empty_patch when no fields are supplied", () => {
+    const r = Memory.store(db, "stub");
+    if (!r.ok) throw new Error("seed");
+    const up = Memory.update(db, r.id, {});
+    expect(up.ok).toBe(false);
+    if (!up.ok) expect(up.reason).toBe("empty_patch");
+  });
+
+  test("rejects non-finite importance", () => {
+    const r = Memory.store(db, "stub two");
+    if (!r.ok) throw new Error("seed");
+    const up = Memory.update(db, r.id, { importance: Number.NaN });
+    expect(up.ok).toBe(false);
+    if (!up.ok) expect(up.reason).toBe("invalid_importance");
+  });
+
+  test("bumps updated_at", async () => {
+    const r = Memory.store(db, "ts check");
+    if (!r.ok) throw new Error("seed");
+    const before = Memory.get(db, r.id);
+    // SQLite's datetime('now') is second-resolution — wait across a boundary.
+    await new Promise((res) => setTimeout(res, 1100));
+    const up = Memory.update(db, r.id, { importance: 0.8 });
+    expect(up.ok).toBe(true);
+    if (up.ok && before) {
+      expect(up.engram.updated_at).not.toBe(before.updated_at);
+    }
+  });
+
+  test("content change requires a new embedding", () => {
+    const r = Memory.store(db, "old wording");
+    if (!r.ok) throw new Error("seed");
+    const up = Memory.update(db, r.id, { content: "new wording" });
+    expect(up.ok).toBe(false);
+    if (!up.ok) expect(up.reason).toBe("embedding_required");
+  });
+
+  test("rejects empty new content", () => {
+    const r = Memory.store(db, "stub");
+    if (!r.ok) throw new Error("seed");
+    const vec = new Array(8).fill(0);
+    vec[0] = 1;
+    const up = Memory.update(db, r.id, { content: "   ", embedding: vec });
+    expect(up.ok).toBe(false);
+    if (!up.ok) expect(up.reason).toBe("empty_content");
+  });
+
+  test("rejects new content that matches another engram", () => {
+    const a = Memory.store(db, "alpha text");
+    const b = Memory.store(db, "beta text");
+    if (!a.ok || !b.ok) throw new Error("seed");
+    const vec = new Array(8).fill(0);
+    vec[0] = 1;
+    const up = Memory.update(db, b.id, { content: "alpha text", embedding: vec });
+    expect(up.ok).toBe(false);
+    if (!up.ok) expect(up.reason).toBe("duplicate_content");
+  });
+
+  test("replaces content + embedding together", () => {
+    const r = Memory.store(db, "v1 content");
+    if (!r.ok) throw new Error("seed");
+    const vec = new Array(16).fill(0);
+    vec[2] = 1;
+    const up = Memory.update(db, r.id, { content: "v2 content", embedding: vec });
+    expect(up.ok).toBe(true);
+    if (up.ok) {
+      expect(up.engram.content).toBe("v2 content");
+      expect(up.engram.embedding).toEqual(vec);
+      expect(up.engram.embedding_dim).toBe(16);
+    }
+  });
+
+  test("trims whitespace in new content", () => {
+    const r = Memory.store(db, "trim seed");
+    if (!r.ok) throw new Error("seed");
+    const vec = new Array(8).fill(0);
+    vec[0] = 1;
+    const up = Memory.update(db, r.id, { content: "  trimmed  ", embedding: vec });
+    expect(up.ok).toBe(true);
+    if (up.ok) expect(up.engram.content).toBe("trimmed");
+  });
+
+  test("re-embedding without content change is allowed", () => {
+    const r = Memory.store(db, "unchanged");
+    if (!r.ok) throw new Error("seed");
+    const vec = new Array(8).fill(0);
+    vec[5] = 1;
+    const up = Memory.update(db, r.id, { embedding: vec });
+    expect(up.ok).toBe(true);
+    if (up.ok) {
+      expect(up.engram.content).toBe("unchanged");
+      expect(up.engram.embedding).toEqual(vec);
     }
   });
 });

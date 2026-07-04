@@ -8,6 +8,7 @@
 import { Database } from "bun:sqlite";
 
 import * as Memory from "./memory.js";
+import * as Originals from "./originals.js";
 import * as Procedural from "./procedural.js";
 import * as Embedder from "./embedder.js";
 
@@ -17,6 +18,7 @@ export type ToolPayload =
   | { kind: "memory_list"; count: number; results: Memory.Engram[] }
   | { kind: "memory_get"; engram: Memory.Engram }
   | { kind: "memory_delete"; deleted: boolean; id: number }
+  | { kind: "memory_update"; engram: Memory.Engram; patched: string[] }
   | { kind: "memory_stats"; stats: ReturnType<typeof Memory.stats> }
   | { kind: "memory_chain"; id: number; count: number; chain: Memory.Engram[] }
   | { kind: "memory_supersede"; old_id: number; new_id: number; type: string }
@@ -57,6 +59,8 @@ export function memory(db: Database, args: Record<string, unknown>): ToolResult 
       return opGet(db, args);
     case "delete":
       return opDelete(db, args);
+    case "update":
+      return opUpdate(db, args);
     case "stats":
       return ok({ kind: "memory_stats", stats: Memory.stats(db) });
     case "chain":
@@ -174,6 +178,84 @@ function opDelete(db: Database, args: Record<string, unknown>): ToolResult {
   return ok({ kind: "memory_delete", deleted: true, id });
 }
 
+function opUpdate(db: Database, args: Record<string, unknown>): ToolResult {
+  const id = numberField(args, "id");
+  if (id === undefined) return err({ kind: "missing_field", field: "id" });
+
+  const patch: Parameters<typeof Memory.update>[2] = {};
+  const patched: string[] = [];
+
+  const content = stringField(args, "content");
+  if (content !== undefined) {
+    patch.content = content;
+    patched.push("content");
+  }
+  const embedding = numberArrayField(args, "embedding");
+  if (embedding !== undefined) {
+    const bad = embedding.find((x) => !Number.isFinite(x));
+    if (bad !== undefined) {
+      return err({ kind: "invalid_input", reason: "embedding contains non-finite values" });
+    }
+    patch.embedding = embedding;
+    patched.push("embedding");
+  }
+  const importance = numberField(args, "importance");
+  if (importance !== undefined) {
+    patch.importance = importance;
+    patched.push("importance");
+  }
+  const category = stringField(args, "category");
+  if (category !== undefined) {
+    patch.category = category;
+    patched.push("category");
+  }
+  const projectId = stringField(args, "project_id");
+  if (projectId !== undefined) {
+    patch.project_id = projectId;
+    patched.push("project_id");
+  }
+  const tags = stringArrayField(args, "tags");
+  if (tags !== undefined) {
+    patch.tags = tags;
+    patched.push("tags");
+  }
+  const metadata = objectField(args, "metadata");
+  if (metadata !== undefined) {
+    patch.metadata = metadata;
+    patched.push("metadata");
+  }
+
+  const result = Memory.update(db, id, patch);
+  if (!result.ok && result.reason === "not_found") {
+    return err({ kind: "not_found", id });
+  }
+  if (!result.ok && result.reason === "empty_patch") {
+    return err({ kind: "missing_field", field: "at least one of content/embedding/importance/category/project_id/tags/metadata" });
+  }
+  if (!result.ok && result.reason === "invalid_importance") {
+    return err({ kind: "invalid_input", reason: "importance must be a finite number" });
+  }
+  if (!result.ok && result.reason === "empty_content") {
+    return err({ kind: "invalid_input", reason: "content is empty" });
+  }
+  if (!result.ok && result.reason === "embedding_required") {
+    return err({
+      kind: "invalid_input",
+      reason: "updating content requires a precomputed `embedding` (the server never calls an embedding model on its own)",
+    });
+  }
+  if (!result.ok && result.reason === "duplicate_content") {
+    return err({
+      kind: "invalid_input",
+      reason: "new content already exists on another engram; use `supersede` instead",
+    });
+  }
+  if (!result.ok) {
+    return err({ kind: "invalid_input", reason: result.reason });
+  }
+  return ok({ kind: "memory_update", engram: result.engram, patched });
+}
+
 function opChain(db: Database, args: Record<string, unknown>): ToolResult {
   const id = numberField(args, "id");
   if (id === undefined) return err({ kind: "missing_field", field: "id" });
@@ -250,38 +332,77 @@ export async function ingest(
   }
 
   if (op === "file") {
-    const path = stringField(args, "path");
-    if (!path) return err({ kind: "missing_field", field: "path" });
-    const file = Bun.file(path);
-    if (!(await file.exists())) {
-      return err({ kind: "file_read_failed", path, reason: "file not found" });
-    }
+    const sourcePath = stringField(args, "path");
+    if (!sourcePath) return err({ kind: "missing_field", field: "path" });
+
+    // Stat first so we can fail fast and produce a clear error before
+    // touching the database.
+    let info;
     try {
-      const content = await file.text();
-      const inner = memory(db, {
-        ...args,
-        operation: "store",
-        content,
-        path: undefined,
-      });
-      if (!inner.ok) return inner;
-      if (inner.payload.kind === "memory_store") {
-        return ok({
-          kind: "ingest",
-          ingested: true,
-          id: inner.payload.id,
-          duplicate: inner.payload.duplicate,
-          mode: "file",
-        });
-      }
-      return err({ kind: "invalid_input", reason: "store returned unexpected payload" });
-    } catch (err) {
+      info = await Originals.statSource(sourcePath);
+    } catch (e) {
       return err({
         kind: "file_read_failed",
-        path,
-        reason: (err as Error).message,
+        path: sourcePath,
+        reason: (e as Error).message,
       });
     }
+
+    // Read the content we'll embed. For folders this is a concat with
+    // per-file headers so the search index still covers everything; the
+    // canonical copies live separately under originals/<id>/.
+    let content: string;
+    try {
+      content = await Originals.readSourceAsText(sourcePath);
+    } catch (e) {
+      return err({
+        kind: "file_read_failed",
+        path: sourcePath,
+        reason: (e as Error).message,
+      });
+    }
+
+    // Two-phase: insert first to allocate the id, then copy into
+    // originals/<id>/. The id is the only stable handle we have for the
+    // destination directory, so it has to come from SQLite.
+    const inner = memory(db, {
+      ...args,
+      operation: "store",
+      content,
+      path: undefined,
+    });
+    if (!inner.ok) return inner;
+    if (inner.payload.kind !== "memory_store") {
+      return err({ kind: "invalid_input", reason: "store returned unexpected payload" });
+    }
+    const id = inner.payload.id;
+
+    // Copy the original into originals/<id>/. We deliberately copy even
+    // for duplicates — the source tree under a given id should always
+    // match whatever was ingested most recently with that id.
+    const root = Originals.originalsRoot(db);
+    await Originals.ensureOriginalsRoot(root);
+    try {
+      await Originals.copySourceToOriginals(root, id, sourcePath);
+    } catch (e) {
+      // The memory row is already created. We surface the copy failure
+      // rather than silently leaving the row without a source, because
+      // the user's invariant is "every memory has a source in
+      // originals/<id>/".
+      return err({
+        kind: "file_read_failed",
+        path: sourcePath,
+        reason: `copy failed: ${(e as Error).message}`,
+      });
+    }
+
+    return ok({
+      kind: "ingest",
+      ingested: true,
+      id,
+      duplicate: inner.payload.duplicate,
+      mode: "file",
+    });
   }
 
   return err({ kind: "unknown_op", op: String(op) });

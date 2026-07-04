@@ -55,13 +55,23 @@ const TOOL_DEFS = [
       "local BM25-style table, so common terms stop dragging unrelated documents " +
       "together. After bulk deletes/restores, run `reindex` to refresh the IDF " +
       "table and re-embed every engram.\n\n" +
-      "Enrichment: when you store user-authored content (a document, post, or " +
-      "conversation) you may also pass `original` (the verbatim original text) " +
-      "and `location` (a file path, URL, or other identifier of where the original " +
-      "lives) so the caller can retrieve full context later. Large artifacts " +
-      "(projects, huge files) should omit `original` and only set `location`. " +
+      "Source files live under `originals/<id>/` next to the database — " +
+      "every engram owns a per-id folder holding one or more source files. " +
+      "Callers never specify a location; the server derives it from the " +
+      "memory id after `ingest file` copies the source in. To replace a " +
+      "memory's source, `supersede` it with a fresh id.\n\n" +
+      "USE `update` to edit an existing memory: pass `id` plus any of " +
+      "`importance` (0..1, clamped), `category`, `project_id`, `tags`, " +
+      "`metadata`. To CHANGE THE `content` of a memory you must also pass " +
+      "a fresh `embedding` vector — the server never calls an embedding " +
+      "model on its own, so without it the stored vector is stale and " +
+      "`search` will miss the new wording. If the new content matches " +
+      "another engram, the update is rejected and you should `supersede` " +
+      "the old one instead. This is the right way to bump or demote a " +
+      "memory's importance after re-evaluating its relevance — don't " +
+      "store a new duplicate, update the existing one. " +
       "Operations: store, search, list, get, " +
-      "delete, stats, chain, supersede, decayed, reindex.",
+      "delete, update, stats, chain, supersede, decayed, reindex.",
     inputSchema: {
       type: "object",
       required: ["operation"],
@@ -74,6 +84,7 @@ const TOOL_DEFS = [
             "list",
             "get",
             "delete",
+            "update",
             "stats",
             "chain",
             "supersede",
@@ -82,13 +93,10 @@ const TOOL_DEFS = [
           ],
         },
         content: { type: "string" },
-        original: { type: "string" },
-        location: { type: "string" },
         embedding: { type: "array", items: { type: "number" } },
         category: { type: "string" },
         importance: { type: "number" },
         query: { type: "string" },
-        embedding: { type: "array", items: { type: "number" } },
         id: { type: "integer" },
         old_id: { type: "integer" },
         new_id: { type: "integer" },
@@ -107,14 +115,18 @@ const TOOL_DEFS = [
   {
     name: "ingest",
     description:
-      "Ingest raw text or a server-readable file into memory.\n\n" +
-      "USE THIS PROACTIVELY. When the user provides a document, transcript, long " +
-      "note, or any sizeable block of text worth remembering, ingest it without asking. " +
-      "File size policy: under 10MB → copy original to the server's `originals/` " +
-      "folder automatically and set `location`. 10MB or more → ask the user for " +
-      "three-way confirmation (copy / link-only / skip) before proceeding. The " +
-      "`original` field is for small inline text from conversation; for file inputs " +
-      "use `path` and let the server handle the copy.\n\n" +
+      "Ingest raw text or a server-readable file/folder into memory.\n\n" +
+      "USE THIS PROACTIVELY. When the user provides a document, transcript, " +
+      "long note, or any sizeable block of text worth remembering, ingest it " +
+      "without asking.\n\n" +
+      "Every ingested file is COPIED into `originals/<id>/` (sibling of " +
+      "the database) automatically — no size prompt, no link-only mode. " +
+      "`path` may point at a single file (markdown, json, txt, …) or at a " +
+      "folder; folders are mirrored recursively under the per-id directory, " +
+      "so one memory can own many source files. The memory's content is " +
+      "searchable text either way (folder text is concatenated with per-file " +
+      "headers). There is no `location` field to set — the source's address " +
+      "is always `originals/<id>/`.\n\n" +
       "After analyzing a repository, use this tool to store the full analysis " +
       "report (README summary, tech stack, architecture notes) into memory. " +
       "Set operation=\"file\" with the path to your analysis output, or " +
@@ -126,8 +138,6 @@ const TOOL_DEFS = [
         operation: { type: "string", enum: ["text", "file"] },
         content: { type: "string" },
         path: { type: "string" },
-        original: { type: "string" },
-        location: { type: "string" },
         category: { type: "string" },
         importance: { type: "number" },
         project_id: { type: "string" },
