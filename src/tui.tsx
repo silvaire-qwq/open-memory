@@ -382,7 +382,9 @@ function DetailView({
     );
 }
 
-const CHROME_ROWS = 4; // top rule + title + bottom rule + footer
+const TOP_CHROME_ROWS = 2; // title + rule (list mode only)
+const BOTTOM_CHROME_ROWS = 2; // rule + FooterHints (always rendered)
+const CHROME_ROWS = TOP_CHROME_ROWS + BOTTOM_CHROME_ROWS; // legacy alias for detail view
 const SEARCH_ROW = 1;
 
 function App({ db }: { db: ReturnType<typeof Memory.openDb> }) {
@@ -447,7 +449,9 @@ function App({ db }: { db: ReturnType<typeof Memory.openDb> }) {
     const termCols = stdout?.columns ?? 100;
     const showHeader = screen === "list";
     const chromeRows =
-        (showHeader ? CHROME_ROWS : 0) + (screen === "search" ? SEARCH_ROW : 0);
+        (showHeader ? TOP_CHROME_ROWS : 0) +
+        (screen === "search" ? SEARCH_ROW : 0) +
+        BOTTOM_CHROME_ROWS;
     const visibleRows = Math.max(3, termRows - chromeRows - 1);
 
     const [scrollTop, setScrollTop] = useState(0);
